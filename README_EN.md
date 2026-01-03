@@ -674,3 +674,5 @@ Main dependencies:
 - `smallvec`: Small vector optimization
 - `serde`: Serialization framework
 
+## note
+This project was copied from the production environment. It only has the general logic and has not been tested in a production environment. It is for learning purposes only.
