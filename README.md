@@ -1,5 +1,7 @@
 # Matching Core
 
+[English Documentation](./README_EN.md) | 中文文档
+
 高性能撮合引擎核心库，使用 Rust 构建，支持多种订单类型和交易品种。
 
 ## 特性
@@ -281,6 +283,12 @@ matching-core/
 | CallOption | 看涨期权 | ✅ |
 | PutOption | 看跌期权 | ✅ |
 
+## 项目地址
+```text
+https://github.com/llc-993/matching-core
+```
+
+
 ## 运行示例
 
 ### 基础撮合演示
@@ -326,10 +334,5 @@ cargo test --test edge_cases_test --release
 - `smallvec`: 小向量优化
 - `serde`: 序列化框架
 
-## 许可证
 
-随便可用
-
-## 联系方式
-提 issuse 就行，从生产上拿出来的代码，大致的逻辑是一样的，这套代码未在公司上应用，所以仅用来交流学习。
 

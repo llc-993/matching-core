@@ -32,6 +32,9 @@ ahash = { version = "0.8.12", features = ["serde"] }
 # CPU 亲和性 (替代 OpenHFT Affinity)
 core_affinity = "0.8.3"
 
+# SIMD 向量化优化
+wide = "0.7.28"
+
 [dev-dependencies]
 criterion = "0.5.1"
 

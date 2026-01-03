@@ -5,6 +5,7 @@ pub mod naive;
 pub mod direct;
 pub mod direct_optimized;
 pub mod advanced;
+pub mod simd_utils;
 
 pub use naive::NaiveOrderBook;
 pub use direct::DirectOrderBook;

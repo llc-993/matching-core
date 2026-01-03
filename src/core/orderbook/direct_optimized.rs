@@ -1,4 +1,5 @@
 use crate::api::*;
+use crate::core::orderbook::simd_utils::*;
 use ahash::AHashMap;
 use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
@@ -98,6 +99,10 @@ pub struct DirectOrderBookOptimized {
     ask_buckets: BTreeMap<Price, PriceBucket>,
     bid_buckets: BTreeMap<Price, PriceBucket>,
     
+    // SIMD 优化开关
+    #[serde(skip)]
+    use_simd: bool,
+    
     // 订单 ID 索引
     order_index: AHashMap<OrderId, OrderIdx>,
     
@@ -116,20 +121,34 @@ impl DirectOrderBookOptimized {
             order_index: AHashMap::with_capacity(100_000),
             best_ask: None,
             best_bid: None,
+            use_simd: true, // 默认启用 SIMD
         }
+    }
+    
+    /// 设置 SIMD 优化开关
+    pub fn set_simd_enabled(&mut self, enabled: bool) {
+        self.use_simd = enabled;
     }
 
     /// GTC 下单
     fn place_gtc(&mut self, cmd: &mut OrderCommand) {
         if self.order_index.contains_key(&cmd.order_id) {
-            let filled = self.try_match(cmd);
+            let filled = if self.use_simd {
+                self.try_match_simd_batch(cmd)
+            } else {
+                self.try_match(cmd)
+            };
             if filled < cmd.size {
                 cmd.matcher_events.push(MatcherTradeEvent::new_reject(cmd.size - filled, cmd.price));
             }
             return;
         }
 
-        let filled = self.try_match(cmd);
+        let filled = if self.use_simd {
+            self.try_match_simd_batch(cmd)
+        } else {
+            self.try_match(cmd)
+        };
 
         if filled < cmd.size {
             if let Some(idx) = self.order_pool.alloc() {
@@ -156,7 +175,11 @@ impl DirectOrderBookOptimized {
 
     /// IOC 下单
     fn place_ioc(&mut self, cmd: &mut OrderCommand) {
-        let filled = self.try_match(cmd);
+        let filled = if self.use_simd {
+            self.try_match_simd_batch(cmd)
+        } else {
+            self.try_match(cmd)
+        };
         if filled < cmd.size {
             cmd.matcher_events.push(MatcherTradeEvent::new_reject(cmd.size - filled, cmd.price));
         }
@@ -334,6 +357,194 @@ impl DirectOrderBookOptimized {
         }
 
         filled
+    }
+
+    /// SIMD 批量撮合优化（高性能版本）
+    fn try_match_simd_batch(&mut self, cmd: &mut OrderCommand) -> Size {
+        let is_bid = cmd.action == OrderAction::Bid;
+        let limit_price = cmd.price;
+        let mut filled = 0;
+
+        // 快速路径：检查最优价格
+        let best_price = if is_bid { self.best_ask } else { self.best_bid };
+        if let Some(best) = best_price {
+            if (is_bid && best > limit_price) || (!is_bid && best < limit_price) {
+                return 0;
+            }
+        } else {
+            return 0;
+        }
+
+        // 收集价格档位
+        let prices_to_match: Vec<Price> = if is_bid {
+            self.ask_buckets.range(..=limit_price).map(|(p, _)| *p).collect()
+        } else {
+            self.bid_buckets.range(limit_price..).rev().map(|(p, _)| *p).collect()
+        };
+
+        let mut need_update_best = false;
+        let mut prices_to_remove = Vec::new();
+
+        for price in prices_to_match {
+            if filled >= cmd.size {
+                break;
+            }
+
+            // 收集该价格档的所有活跃订单
+            let mut order_indices = Vec::new();
+            {
+                let buckets = if is_bid { &self.ask_buckets } else { &self.bid_buckets };
+                if let Some(bucket) = buckets.get(&price) {
+                    let mut current_idx = bucket.head;
+                    
+                    while self.order_pool.hot.active[current_idx] {
+                        order_indices.push(current_idx);
+                        if let Some(next) = self.order_pool.hot.next[current_idx] {
+                            current_idx = next;
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if order_indices.is_empty() {
+                continue;
+            }
+
+            // SIMD 批量处理（如果订单数量 >= 4）
+            if order_indices.len() >= 4 {
+                let matched = self.simd_match_orders_internal(
+                    &order_indices,
+                    cmd.size - filled,
+                    price,
+                    cmd.action,
+                    cmd.reserve_price,
+                    &mut cmd.matcher_events,
+                );
+                filled += matched;
+            } else {
+                // 少量订单使用标准处理
+                for &idx in &order_indices {
+                    if filled >= cmd.size {
+                        break;
+                    }
+                    
+                    let order_remaining = self.order_pool.hot.sizes[idx] - self.order_pool.hot.filled[idx];
+                    let trade_size = (cmd.size - filled).min(order_remaining);
+
+                    self.order_pool.hot.filled[idx] += trade_size;
+                    filled += trade_size;
+
+                    let maker_uid = self.order_pool.cold[idx].uid;
+                    let reserve = if is_bid {
+                        cmd.reserve_price
+                    } else {
+                        self.order_pool.cold[idx].reserve_price
+                    };
+                    
+                    cmd.matcher_events.push(MatcherTradeEvent::new_trade(
+                        trade_size,
+                        price,
+                        self.order_pool.hot.order_ids[idx],
+                        maker_uid,
+                        reserve,
+                    ));
+
+                    if self.order_pool.hot.filled[idx] >= self.order_pool.hot.sizes[idx] {
+                        let order_id = self.order_pool.hot.order_ids[idx];
+                        self.order_index.remove(&order_id);
+                        self.order_pool.dealloc(idx);
+                    }
+                }
+            }
+
+            // 更新桶信息
+            {
+                let buckets = if is_bid { &mut self.ask_buckets } else { &mut self.bid_buckets };
+                if let Some(bucket) = buckets.get_mut(&price) {
+                    // 重新计算桶的总量
+                    let mut new_volume = 0;
+                    for &idx in &order_indices {
+                        if self.order_pool.hot.active[idx] {
+                            new_volume += self.order_pool.hot.sizes[idx] - self.order_pool.hot.filled[idx];
+                        }
+                    }
+                    bucket.volume = new_volume;
+                    
+                    if bucket.volume == 0 {
+                        prices_to_remove.push(price);
+                        need_update_best = true;
+                    }
+                }
+            }
+        }
+
+        // 清理空桶
+        for price in prices_to_remove {
+            if is_bid {
+                self.ask_buckets.remove(&price);
+            } else {
+                self.bid_buckets.remove(&price);
+            }
+        }
+
+        if need_update_best {
+            self.update_best_price(is_bid);
+        }
+
+        filled
+    }
+
+    /// SIMD 批量处理订单
+    #[inline]
+    fn simd_match_orders_internal(
+        &mut self,
+        order_indices: &[OrderIdx],
+        need_size: Size,
+        price: Price,
+        taker_action: OrderAction,
+        taker_reserve: Price,
+        events: &mut Vec<MatcherTradeEvent>,
+    ) -> Size {
+        // 收集订单数据（SOA 优势）
+        let sizes: Vec<i64> = order_indices.iter()
+            .map(|&idx| self.order_pool.hot.sizes[idx])
+            .collect();
+        
+        let filled: Vec<i64> = order_indices.iter()
+            .map(|&idx| self.order_pool.hot.filled[idx])
+            .collect();
+
+        // SIMD 批量计算匹配量
+        let (matched_sizes, _total_matched) = simd_batch_match_prepare(&sizes, &filled, need_size);
+
+        // 应用匹配结果
+        let mut actual_filled = 0i64;
+        for (i, &idx) in order_indices.iter().enumerate() {
+            let match_size = matched_sizes[i];
+            if match_size > 0 {
+                self.order_pool.hot.filled[idx] += match_size;
+                actual_filled += match_size;
+
+                let maker_uid = self.order_pool.cold[idx].uid;
+                let reserve = if taker_action == OrderAction::Bid {
+                    taker_reserve
+                } else {
+                    self.order_pool.cold[idx].reserve_price
+                };
+
+                events.push(MatcherTradeEvent::new_trade(
+                    match_size,
+                    price,
+                    self.order_pool.hot.order_ids[idx],
+                    maker_uid,
+                    reserve,
+                ));
+            }
+        }
+
+        actual_filled
     }
 
     /// 插入订单到价格桶
